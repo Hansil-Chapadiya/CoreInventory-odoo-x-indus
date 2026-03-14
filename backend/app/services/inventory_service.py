@@ -1,169 +1,264 @@
 """
-Email service — welcome emails and OTP emails via Gmail SMTP.
-Uses fastapi-mail with settings from config.
-The mailer is lazy-initialized so the app starts even without email credentials.
+Inventory service — the core engine that derives stock from movements.
+All stock-changing operations MUST go through this service.
 """
 
-import logging
-from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+from datetime import datetime, timezone
+from uuid import UUID
 
-from app.core.config import settings
+from sqlalchemy import select, func, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-logger = logging.getLogger(__name__)
+from app.models.inventory import MovementType, StockMovement, StockSnapshot
+from app.models.warehouse import Location
 
-_mailer: FastMail | None = None
 
+class InventoryService:
+    """Stateless service — instantiate with a db session per request."""
 
-def _get_mailer() -> FastMail | None:
-    """Return a configured FastMail instance, or None if credentials are missing."""
-    global _mailer
-    if _mailer is not None:
-        return _mailer
+    def __init__(self, db: AsyncSession):
+        self.db = db
 
-    if not settings.MAIL_USERNAME or not settings.MAIL_PASSWORD:
-        logger.warning(
-            "Email credentials not configured (MAIL_USERNAME / MAIL_PASSWORD). "
-            "Emails will be skipped."
+    # ------------------------------------------------------------------
+    # Stock queries (derived from movements)
+    # ------------------------------------------------------------------
+
+    async def get_stock_at_location(
+        self, product_id: UUID, location_id: UUID
+    ) -> float:
+        """Current on-hand qty for a product at a specific location."""
+        result = await self.db.execute(
+            text("""
+                SELECT COALESCE(SUM(qty), 0) AS on_hand
+                FROM (
+                    SELECT  quantity AS qty FROM stock_movements
+                    WHERE product_id = :pid AND to_location_id = :lid
+                    UNION ALL
+                    SELECT -quantity AS qty FROM stock_movements
+                    WHERE product_id = :pid AND from_location_id = :lid
+                ) sub
+            """),
+            {"pid": str(product_id), "lid": str(location_id)},
         )
-        return None
+        return float(result.scalar_one())
 
-    mail_from = settings.MAIL_FROM if settings.MAIL_FROM else settings.MAIL_USERNAME
-    config = ConnectionConfig(
-        MAIL_USERNAME=settings.MAIL_USERNAME,
-        MAIL_PASSWORD=settings.MAIL_PASSWORD,
-        MAIL_FROM=mail_from,
-        MAIL_FROM_NAME=settings.MAIL_FROM_NAME,
-        MAIL_PORT=587,
-        MAIL_SERVER="smtp.gmail.com",
-        MAIL_STARTTLS=True,
-        MAIL_SSL_TLS=False,
-        USE_CREDENTIALS=True,
-        VALIDATE_CERTS=True,
-    )
-    _mailer = FastMail(config)
-    return _mailer
+    async def get_stock_in_warehouse(
+        self, product_id: UUID, warehouse_id: UUID
+    ) -> float:
+        """Sum on-hand across all locations in a warehouse."""
+        result = await self.db.execute(
+            text("""
+                SELECT COALESCE(SUM(qty), 0)
+                FROM (
+                    SELECT sm.quantity AS qty
+                    FROM stock_movements sm
+                    JOIN locations l ON l.id = sm.to_location_id
+                    WHERE sm.product_id = :pid AND l.warehouse_id = :wid
+                    UNION ALL
+                    SELECT -sm.quantity AS qty
+                    FROM stock_movements sm
+                    JOIN locations l ON l.id = sm.from_location_id
+                    WHERE sm.product_id = :pid AND l.warehouse_id = :wid
+                ) sub
+            """),
+            {"pid": str(product_id), "wid": str(warehouse_id)},
+        )
+        return float(result.scalar_one())
 
+    async def get_global_stock(self, product_id: UUID) -> float:
+        """Total on-hand across all warehouses."""
+        result = await self.db.execute(
+            text("""
+                SELECT COALESCE(SUM(qty), 0)
+                FROM (
+                    SELECT  quantity AS qty FROM stock_movements
+                    WHERE product_id = :pid AND to_location_id IS NOT NULL
+                    UNION ALL
+                    SELECT -quantity AS qty FROM stock_movements
+                    WHERE product_id = :pid AND from_location_id IS NOT NULL
+                ) sub
+            """),
+            {"pid": str(product_id)},
+        )
+        return float(result.scalar_one())
 
-async def send_welcome_email(to_email: str, full_name: str) -> None:
-    """Send a welcome email to a newly registered user."""
-    mailer = _get_mailer()
-    if mailer is None:
-        return
+    # ------------------------------------------------------------------
+    # Movement creation (the ONLY way to change stock)
+    # ------------------------------------------------------------------
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <style>
-        body {{ font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }}
-        .container {{ max-width: 600px; margin: 40px auto; background: #fff;
-                      border-radius: 8px; overflow: hidden;
-                      box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-        .header {{ background: #1a56db; color: #fff; padding: 32px 40px; }}
-        .header h1 {{ margin: 0; font-size: 24px; }}
-        .body {{ padding: 32px 40px; color: #333; }}
-        .body p {{ line-height: 1.6; }}
-        .highlight {{ background: #f0f5ff; border-left: 4px solid #1a56db;
-                      padding: 12px 16px; border-radius: 4px; margin: 20px 0; }}
-        .footer {{ background: #f8f8f8; padding: 20px 40px;
-                   color: #888; font-size: 13px; text-align: center; }}
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="header">
-          <h1>Welcome to CoreInventory</h1>
-        </div>
-        <div class="body">
-          <p>Hi <strong>{full_name}</strong>,</p>
-          <p>Your account has been created successfully. You now have access to
-             the CoreInventory platform.</p>
-          <div class="highlight">
-            <strong>What you can do:</strong><br>
-            Manage warehouses, track stock movements, validate receipts and
-            deliveries, and monitor inventory levels in real time.
-          </div>
-          <p>Log in using your username and password at any time. If you need
-             help, contact your system administrator.</p>
-          <p>Welcome aboard!</p>
-        </div>
-        <div class="footer">CoreInventory &mdash; Production-grade Inventory Management</div>
-      </div>
-    </body>
-    </html>
-    """
-    message = MessageSchema(
-        subject="Welcome to CoreInventory",
-        recipients=[to_email],
-        body=html,
-        subtype=MessageType.html,
-    )
-    await mailer.send_message(message)
+    async def create_movement(
+        self,
+        *,
+        product_id: UUID,
+        from_location_id: UUID | None,
+        to_location_id: UUID | None,
+        quantity: float,
+        movement_type: MovementType,
+        reference_type: str,
+        reference_id: UUID,
+        created_by: UUID,
+        notes: str | None = None,
+    ) -> StockMovement:
+        """Create an immutable stock movement record."""
+        if quantity <= 0:
+            raise ValueError("Movement quantity must be positive")
 
+        if from_location_id is None and to_location_id is None:
+            raise ValueError("At least one of from_location_id or to_location_id is required")
 
-async def send_otp_email(to_email: str, full_name: str, otp_code: str) -> None:
-    """Send a password-reset OTP code to the user."""
-    mailer = _get_mailer()
-    if mailer is None:
-        return
+        movement = StockMovement(
+            product_id=product_id,
+            from_location_id=from_location_id,
+            to_location_id=to_location_id,
+            quantity=quantity,
+            movement_type=movement_type,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            created_by=created_by,
+            notes=notes,
+        )
+        self.db.add(movement)
+        await self.db.flush()
+        return movement
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <style>
-        body {{ font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }}
-        .container {{ max-width: 600px; margin: 40px auto; background: #fff;
-                      border-radius: 8px; overflow: hidden;
-                      box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-        .header {{ background: #1a56db; color: #fff; padding: 32px 40px; }}
-        .header h1 {{ margin: 0; font-size: 24px; }}
-        .body {{ padding: 32px 40px; color: #333; }}
-        .body p {{ line-height: 1.6; }}
-        .otp-box {{ background: #f0f5ff; border: 2px dashed #1a56db;
-                    border-radius: 8px; text-align: center;
-                    padding: 24px; margin: 24px 0; }}
-        .otp-code {{ font-size: 42px; font-weight: bold; letter-spacing: 12px;
-                     color: #1a56db; }}
-        .warning {{ background: #fff8e1; border-left: 4px solid #f59e0b;
-                    padding: 12px 16px; border-radius: 4px;
-                    color: #78350f; font-size: 14px; }}
-        .footer {{ background: #f8f8f8; padding: 20px 40px;
-                   color: #888; font-size: 13px; text-align: center; }}
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="header">
-          <h1>Password Reset Request</h1>
-        </div>
-        <div class="body">
-          <p>Hi <strong>{full_name}</strong>,</p>
-          <p>We received a request to reset your CoreInventory password.
-             Use the code below to complete the reset:</p>
-          <div class="otp-box">
-            <div class="otp-code">{otp_code}</div>
-            <p style="margin:8px 0 0; color:#555; font-size:14px;">
-              Valid for <strong>10 minutes</strong>
-            </p>
-          </div>
-          <div class="warning">
-            If you did not request a password reset, please ignore this email.
-            Your password will not be changed.
-          </div>
-          <p>For security reasons, this code can only be used once.</p>
-        </div>
-        <div class="footer">CoreInventory &mdash; Production-grade Inventory Management</div>
-      </div>
-    </body>
-    </html>
-    """
-    message = MessageSchema(
-        subject="Your CoreInventory Password Reset Code",
-        recipients=[to_email],
-        body=html,
-        subtype=MessageType.html,
-    )
-    await mailer.send_message(message)
+    # ------------------------------------------------------------------
+    # Convenience: operation-specific movement creators
+    # ------------------------------------------------------------------
+
+    async def record_receipt(
+        self,
+        *,
+        product_id: UUID,
+        to_location_id: UUID,
+        quantity: float,
+        receipt_id: UUID,
+        created_by: UUID,
+    ) -> StockMovement:
+        """Goods IN from vendor — from_location is NULL (outside system)."""
+        return await self.create_movement(
+            product_id=product_id,
+            from_location_id=None,
+            to_location_id=to_location_id,
+            quantity=quantity,
+            movement_type=MovementType.RECEIPT,
+            reference_type="receipt",
+            reference_id=receipt_id,
+            created_by=created_by,
+        )
+
+    async def record_delivery(
+        self,
+        *,
+        product_id: UUID,
+        from_location_id: UUID,
+        quantity: float,
+        delivery_order_id: UUID,
+        created_by: UUID,
+    ) -> StockMovement:
+        """Goods OUT to customer — to_location is NULL (outside system)."""
+        return await self.create_movement(
+            product_id=product_id,
+            from_location_id=from_location_id,
+            to_location_id=None,
+            quantity=quantity,
+            movement_type=MovementType.DELIVERY,
+            reference_type="delivery",
+            reference_id=delivery_order_id,
+            created_by=created_by,
+        )
+
+    async def record_transfer(
+        self,
+        *,
+        product_id: UUID,
+        from_location_id: UUID,
+        to_location_id: UUID,
+        quantity: float,
+        transfer_id: UUID,
+        created_by: UUID,
+    ) -> StockMovement:
+        """Internal move between locations."""
+        return await self.create_movement(
+            product_id=product_id,
+            from_location_id=from_location_id,
+            to_location_id=to_location_id,
+            quantity=quantity,
+            movement_type=MovementType.INTERNAL_TRANSFER,
+            reference_type="transfer",
+            reference_id=transfer_id,
+            created_by=created_by,
+        )
+
+    async def record_adjustment(
+        self,
+        *,
+        product_id: UUID,
+        location_id: UUID,
+        difference_qty: float,
+        adjustment_id: UUID,
+        created_by: UUID,
+    ) -> StockMovement:
+        """
+        Stock correction.
+        Positive difference = stock gained  (to_location = location, from = NULL).
+        Negative difference = stock lost    (from_location = location, to = NULL).
+        """
+        if difference_qty == 0:
+            raise ValueError("Adjustment difference is zero — no movement needed")
+
+        if difference_qty > 0:
+            return await self.create_movement(
+                product_id=product_id,
+                from_location_id=None,
+                to_location_id=location_id,
+                quantity=abs(difference_qty),
+                movement_type=MovementType.ADJUSTMENT,
+                reference_type="adjustment",
+                reference_id=adjustment_id,
+                created_by=created_by,
+            )
+        else:
+            return await self.create_movement(
+                product_id=product_id,
+                from_location_id=location_id,
+                to_location_id=None,
+                quantity=abs(difference_qty),
+                movement_type=MovementType.ADJUSTMENT,
+                reference_type="adjustment",
+                reference_id=adjustment_id,
+                created_by=created_by,
+            )
+
+    # ------------------------------------------------------------------
+    # Snapshot refresh (for performance optimisation)
+    # ------------------------------------------------------------------
+
+    async def refresh_snapshots(self) -> int:
+        """
+        Rebuild the stock_snapshots table from stock_movements.
+        Returns the number of snapshot rows upserted.
+        """
+        result = await self.db.execute(
+            text("""
+                INSERT INTO stock_snapshots (id, product_id, location_id, quantity, snapshot_at)
+                SELECT
+                    uuid_generate_v4(),
+                    sub.product_id,
+                    sub.location_id,
+                    SUM(sub.qty),
+                    NOW()
+                FROM (
+                    SELECT product_id, to_location_id AS location_id, quantity AS qty
+                    FROM stock_movements WHERE to_location_id IS NOT NULL
+                    UNION ALL
+                    SELECT product_id, from_location_id AS location_id, -quantity AS qty
+                    FROM stock_movements WHERE from_location_id IS NOT NULL
+                ) sub
+                GROUP BY sub.product_id, sub.location_id
+                ON CONFLICT (product_id, location_id)
+                DO UPDATE SET
+                    quantity = EXCLUDED.quantity,
+                    snapshot_at = EXCLUDED.snapshot_at
+            """)
+        )
+        return result.rowcount
