@@ -1,12 +1,15 @@
 """
-Authentication endpoints: register, login, refresh, logout, me.
+Authentication endpoints: register, login, refresh, logout, me,
+forgot-password (OTP), reset-password.
 """
 
+import asyncio
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from jose import JWTError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -19,15 +22,19 @@ from app.core.security import (
     verify_password,
 )
 from app.core.config import settings
-from app.models.auth import User, UserRole, UserSession
+from app.models.auth import User, UserRole, UserSession, OTPVerification
 from app.schemas.schemas import (
+    ForgotPasswordRequest,
     LoginRequest,
+    MessageResponse,
     RefreshTokenRequest,
+    ResetPasswordRequest,
     TokenRefreshResponse,
     TokenResponse,
     UserCreate,
     UserOut,
 )
+from app.services.email_service import send_otp_email, send_welcome_email
 
 router = APIRouter()
 
@@ -63,6 +70,7 @@ async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     db.add(user)
     await db.flush()
     await db.refresh(user)
+    asyncio.create_task(send_welcome_email(user.email, user.full_name))
     return user
 
 
@@ -207,3 +215,124 @@ async def logout(
 async def get_me(current_user: User = Depends(get_current_user)):
     """Return the profile of the currently authenticated user."""
     return current_user
+
+
+# ─────────────────────────────────────────
+# POST /auth/forgot-password
+# ─────────────────────────────────────────
+
+@router.post("/forgot-password", response_model=MessageResponse)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send a 6-digit OTP to the user's email for password reset.
+    Always returns 200 to prevent email enumeration.
+    """
+    _safe_response = MessageResponse(
+        message="If that email is registered, an OTP has been sent."
+    )
+
+    result = await db.execute(
+        select(User).where(
+            User.email == payload.email,
+            User.is_active.is_(True),
+            User.is_deleted.is_(False),
+        )
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        return _safe_response
+
+    # Invalidate any existing unused OTPs for this user
+    await db.execute(
+        update(OTPVerification)
+        .where(
+            OTPVerification.user_id == user.id,
+            OTPVerification.purpose == "forgot_password",
+            OTPVerification.is_used.is_(False),
+        )
+        .values(is_used=True)
+    )
+
+    # Generate a 6-digit OTP
+    otp_code = str(secrets.randbelow(1_000_000)).zfill(6)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    otp = OTPVerification(
+        user_id=user.id,
+        otp_code=otp_code,
+        purpose="forgot_password",
+        expires_at=expires_at,
+    )
+    db.add(otp)
+    await db.flush()
+
+    asyncio.create_task(send_otp_email(user.email, user.full_name, otp_code))
+
+    return _safe_response
+
+
+# ─────────────────────────────────────────
+# POST /auth/reset-password
+# ─────────────────────────────────────────
+
+@router.post("/reset-password", response_model=MessageResponse)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verify the OTP and set a new password.
+    Deactivates all existing sessions (forces re-login).
+    """
+    invalid_otp = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid or expired OTP",
+    )
+
+    user_result = await db.execute(
+        select(User).where(
+            User.email == payload.email,
+            User.is_active.is_(True),
+            User.is_deleted.is_(False),
+        )
+    )
+    user = user_result.scalar_one_or_none()
+    if not user:
+        raise invalid_otp
+
+    now = datetime.now(timezone.utc)
+    otp_result = await db.execute(
+        select(OTPVerification)
+        .where(
+            OTPVerification.user_id == user.id,
+            OTPVerification.purpose == "forgot_password",
+            OTPVerification.is_used.is_(False),
+            OTPVerification.expires_at > now,
+        )
+        .order_by(OTPVerification.created_at.desc())
+        .limit(1)
+    )
+    otp = otp_result.scalar_one_or_none()
+
+    if not otp or otp.otp_code != payload.otp_code:
+        raise invalid_otp
+
+    # Mark OTP as used
+    otp.is_used = True
+
+    # Update password
+    user.hashed_password = hash_password(payload.new_password)
+
+    # Force re-login: deactivate all sessions
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user.id, UserSession.is_active.is_(True))
+        .values(is_active=False)
+    )
+
+    await db.flush()
+    return MessageResponse(message="Password reset successfully. Please log in again.")
+
