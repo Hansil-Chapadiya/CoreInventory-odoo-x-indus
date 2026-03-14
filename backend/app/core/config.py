@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     MAIL_FROM_NAME: str = "CoreInventory"
 
     # CORS (React frontend)
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    CORS_ORIGINS: list[str] = ["*"]
 
     class Config:
         env_file = ".env"
