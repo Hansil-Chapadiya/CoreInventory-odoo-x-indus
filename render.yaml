@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: coreinventory-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APP_NAME
+        value: CoreInventory
+      - key: APP_VERSION
+        value: 1.0.0
+      - key: DEBUG
+        value: false
+      - key: DATABASE_ECHO
+        value: false
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: 30
+      - key: REFRESH_TOKEN_EXPIRE_DAYS
+        value: 7
+      # Set these in the Render Dashboard > Environment tab (never commit secrets):
+      # DATABASE_URL  = postgresql+asyncpg://user:pass@host/db?ssl=require
+      # SECRET_KEY    = <random 64-char string>
+      # CORS_ORIGINS  = ["https://your-frontend.onrender.com","http://localhost:5173"]
+      - key: DATABASE_URL
+        sync: false   # marks it as a secret — must be set in dashboard
+      - key: SECRET_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
