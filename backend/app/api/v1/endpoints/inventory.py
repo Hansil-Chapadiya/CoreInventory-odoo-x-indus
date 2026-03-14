@@ -30,7 +30,9 @@ async def get_current_stock(
     _: User = Depends(get_current_user),
 ):
     """Current stock levels derived from movements. Filterable by product/warehouse/location."""
-    q = text("""
+
+    # Build SQL dynamically — avoids passing NULL bind params and the ::uuid cast conflict
+    sql = """
         SELECT
             sub.product_id,
             p.name  AS product_name,
@@ -50,19 +52,33 @@ async def get_current_stock(
         JOIN products   p ON p.id = sub.product_id
         JOIN locations  l ON l.id = sub.location_id
         JOIN warehouses w ON w.id = l.warehouse_id
-        WHERE (:product_id   IS NULL OR sub.product_id   = :product_id::uuid)
-          AND (:warehouse_id IS NULL OR l.warehouse_id   = :warehouse_id::uuid)
-          AND (:location_id  IS NULL OR sub.location_id  = :location_id::uuid)
+    """
+
+    conditions, params = [], {}
+
+    if product_id:
+        conditions.append("sub.product_id = CAST(:product_id AS uuid)")
+        params["product_id"] = str(product_id)
+
+    if warehouse_id:
+        conditions.append("l.warehouse_id = CAST(:warehouse_id AS uuid)")
+        params["warehouse_id"] = str(warehouse_id)
+
+    if location_id:
+        conditions.append("sub.location_id = CAST(:location_id AS uuid)")
+        params["location_id"] = str(location_id)
+
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+
+    sql += """
         GROUP BY sub.product_id, sub.location_id, p.name, p.sku,
                  l.name, l.warehouse_id, w.name
         HAVING SUM(sub.qty) != 0
         ORDER BY p.name, w.name, l.name
-    """)
-    result = await db.execute(q, {
-        "product_id":   str(product_id)   if product_id   else None,
-        "warehouse_id": str(warehouse_id) if warehouse_id else None,
-        "location_id":  str(location_id)  if location_id  else None,
-    })
+    """
+
+    result = await db.execute(text(sql), params)
     return [StockLevelOut(**dict(row)) for row in result.mappings().all()]
 
 
