@@ -1,13 +1,32 @@
-# CoreInventory Backend Dependencies
+# ============================================================
+# CoreInventory Backend — Requirements
+# Python 3.12+  |  FastAPI + SQLAlchemy (async) + PostgreSQL
+# ============================================================
 
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-sqlalchemy[asyncio]>=2.0.36
-asyncpg>=0.30.0
-pydantic>=2.10.0
-pydantic-settings>=2.6.0
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-python-multipart>=0.0.17
-alembic>=1.14.0
-email-validator>=2.2.0
+# ── Web Framework ────────────────────────────────────────────
+fastapi>=0.115.0                  # API framework
+uvicorn[standard]>=0.32.0         # ASGI server (includes httptools, websockets)
+starlette>=0.40.0                 # FastAPI's underlying ASGI framework
+python-multipart>=0.0.17          # Required for form data & file uploads in FastAPI
+
+# ── Database ─────────────────────────────────────────────────
+sqlalchemy[asyncio]>=2.0.36       # ORM with async support
+asyncpg>=0.30.0                   # Async PostgreSQL driver (Neon compatible)
+alembic>=1.14.0                   # Database migrations
+greenlet>=3.0.0                   # Required by SQLAlchemy async engine internals
+
+# ── Validation & Settings ─────────────────────────────────────
+pydantic>=2.10.0                  # Request / response schema validation
+pydantic-settings>=2.6.0          # Settings loaded from .env
+email-validator>=2.2.0            # Validates EmailStr fields in Pydantic
+python-dotenv>=1.0.0              # .env file loading (used by pydantic-settings)
+
+# ── Authentication & Security ─────────────────────────────────
+python-jose[cryptography]>=3.3.0  # JWT encode / decode
+passlib[bcrypt]>=1.7.4            # Password hashing abstraction
+bcrypt>=4.0.0                     # bcrypt backend for passlib
+cryptography>=41.0.0              # Crypto primitives for python-jose
+
+# ── Async & HTTP ─────────────────────────────────────────────
+httpx>=0.27.0                     # Async HTTP client (Starlette TestClient + requests)
+anyio>=4.0.0                      # Async backend abstraction (SQLAlchemy + Starlette)
