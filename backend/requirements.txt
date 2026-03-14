@@ -23,10 +23,11 @@ python-dotenv>=1.0.0              # .env file loading (used by pydantic-settings
 
 # ── Authentication & Security ─────────────────────────────────
 python-jose[cryptography]>=3.3.0  # JWT encode / decode
-passlib[bcrypt]>=1.7.4            # Password hashing abstraction
-bcrypt>=4.0.0                     # bcrypt backend for passlib
+bcrypt>=4.0.0                     # Direct bcrypt password hashing
 cryptography>=41.0.0              # Crypto primitives for python-jose
 
 # ── Async & HTTP ─────────────────────────────────────────────
 httpx>=0.27.0                     # Async HTTP client (Starlette TestClient + requests)
 anyio>=4.0.0                      # Async backend abstraction (SQLAlchemy + Starlette)
+
+fastapi-mail>=1.4.1               # Async email sending (SMTP / Gmail)
